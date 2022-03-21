@@ -1,0 +1,313 @@
+/**********************************************************************/
+// ENGR-2350 Template Project
+// Name: Wyatt Garber and Jennifer Canfield
+// RIN: 661721523 and 661992677
+// This is the base project for several activities and labs throughout
+// the course.  The outline provided below isn't necessarily *required*
+// by a C program; however, this format is required within ENGR-2350
+// to ease debugging/grading by the staff.
+/**********************************************************************/
+
+// We'll always add this include statement. This basically takes the
+// code contained within the "engr_2350_msp432.h" file and adds it here.
+#include "engr2350_msp432.h"
+
+// Add function prototypes here, as needed.
+void GPIO_Init();
+void Timer_Init();
+void Encoder_ISR();
+void Drive(uint32_t * distances, int32_t * turns, double * coeff);
+void Straight(uint32_t dist);
+void Turn(int32_t turn, double coeff);
+void turn_off(); //function to turn wheels off
+uint32_t pathR[] = {1300, 860, 860, 860, 1830}; //path for R in mm--> turn in between each distance
+uint32_t pathI[] = {860, 430, 1830, 430, 860}; //path for I in mm
+int32_t turnsR[] = {312, 90, 90, 90, 0}; //turns for path R //make this 5 by adding 0 at the end and for I turns too-> so it fits the same for loop as the dinatces
+int32_t turnsI[] = {180, 270, 90, 180, 0}; //turns for path I
+
+double coeff_R[] = {12.0/7,15.5/7 , 15.5/7 , 15.5/7 , 0};//turning coefficients
+double coeff_I[] = {16.0/7, 31.0/14, 15.5/7, 16.0/7, 0};//turning coefficients
+
+uint8_t BMP0; //Path R start
+uint8_t BMP1; //Path I start
+
+uint16_t distance_l ; // Calculate distance travelled in mm
+uint16_t speed_rpm_l ; // Calculate the instantaneous wheel speed in rpm
+uint16_t speed_mm_l ;
+uint16_t distance_r ; // Calculate distance travelled in mm
+uint16_t speed_rpm_r ; // Calculate the instantaneous wheel speed in rpm
+uint16_t speed_mm_r ;
+
+// Add global variables here, as needed.
+Timer_A_UpModeConfig Timer0;
+Timer_A_CompareModeConfig TimerC3; //config right wheel
+Timer_A_CompareModeConfig TimerC4; //config left wheel
+int16_t cvalue3 = 0; //pwm duty cycle for right wheel --> current pwm
+int16_t cvalue4 = 0; //pwm duty cycle for left wheel --> current pwm
+//left wheel
+uint32_t enc_total_l = 0; //keep track of total encoder events
+int32_t enc_counts_track_l = 0; //keep track the timer counts since capture event
+int32_t enc_counts_l = 0; //final value of timer counts between capture events
+uint8_t enc_flag_l = 0; //flag to denote that a capture event has occurred
+//right wheel
+uint32_t enc_total_r = 0; //keep track of total encoder events
+int32_t enc_counts_track_r = 0; //keep track the timer counts since capture event
+int32_t enc_counts_r = 0; //final value of timer counts between capture events
+uint8_t enc_flag_r = 0; //flag to denote that a capture event has occurred
+
+Timer_A_ContinuousModeConfig Timer3;
+uint8_t radius = 35; //mm
+int32_t old_enc_counts = 0;
+Timer_A_CaptureModeConfig CCR3;
+Timer_A_CaptureModeConfig CCR4;
+
+int32_t speed_l = 0; //store summation of wheel speed (timer counts) measurements for left wheel
+int32_t speed_r = 0; //store summation of wheel speed (timer counts) measurements for right wheel
+int16_t meas_total_l = 0; //track number of measurements in the summation variable for left wheel
+int16_t meas_total_r = 0; //track number of measurements in the summation variable for right wheel
+uint32_t global_delay = 0;
+uint32_t turnrate = 30; //degrees per second at 200 wheel speed
+
+int main(void) /* Main Function */
+{
+    // Add local variables here, as needed.
+
+    // We always call the "SysInit()" first to set up the microcontroller
+    // for how we are going to use it.
+    SysInit();
+    GPIO_Init();
+    Timer_Init();
+
+    // Place initialization code (or run-once) code here
+
+    while (1)
+    {
+        // Place code that runs continuously in here
+        BMP0 = GPIO_getInputPinValue(GPIO_PORT_P4, GPIO_PIN0); //path R
+        BMP1 = GPIO_getInputPinValue(GPIO_PORT_P4, GPIO_PIN2); //path I
+        if(!BMP0){ //start path for R
+            __delay_cycles(240e3); //delay thing, do we still need this?
+            turn_off(); //just to make sure everything starts off first --> we can also put this before the if statements?
+            printf("path R");
+            Drive(pathR, turnsR, coeff_R); //call drive with path R and turns R
+
+        }
+        if(!BMP1){ //start path for I
+            __delay_cycles(240e3); //delay thing, do we still need this?
+            turn_off();
+            Drive(pathI, turnsI, coeff_I); //call drive with path I and turns I
+            printf("path I");
+        }
+    }
+}
+
+// Add function declarations here as needed
+void GPIO_Init()
+{
+    GPIO_setAsOutputPin(GPIO_PORT_P3, GPIO_PIN7 | GPIO_PIN6); //3.7 EN for LM and 3.6 EN for RM
+    GPIO_setOutputHighOnPin(GPIO_PORT_P3, GPIO_PIN7 | GPIO_PIN6); //ENABLE LM AND RM
+    GPIO_setAsOutputPin(GPIO_PORT_P5, GPIO_PIN4 | GPIO_PIN5); // 5.4 for Dir LM and 5.5 for Dir RM
+    GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN4 | GPIO_PIN5); //set Dir to forwards for LM and RM
+    GPIO_setAsPeripheralModuleFunctionOutputPin( GPIO_PORT_P2, GPIO_PIN7, GPIO_PRIMARY_MODULE_FUNCTION); //2.7 lM 2.6 RM
+    GPIO_setAsPeripheralModuleFunctionOutputPin( GPIO_PORT_P2, GPIO_PIN6, GPIO_PRIMARY_MODULE_FUNCTION);
+    //2.6/RM -> TA0.3, 2.7/LM -> TA0.4
+    GPIO_setAsPeripheralModuleFunctionInputPin( GPIO_PORT_P10, GPIO_PIN4, GPIO_PRIMARY_MODULE_FUNCTION); //10.4 right wheel encoder
+    GPIO_setAsPeripheralModuleFunctionInputPin( GPIO_PORT_P10, GPIO_PIN5, GPIO_PRIMARY_MODULE_FUNCTION); //10.5 left wheel encoder
+    //set bumper 0 to path R, bumper 1 to path I
+    GPIO_setAsInputPinWithPullUpResistor(GPIO_PORT_P4, GPIO_PIN0 | GPIO_PIN2);
+
+}
+void Timer_Init()
+{
+
+    //timer_A0_base
+    Timer0.clockSource = TIMER_A_CLOCKSOURCE_SMCLK; //config timerA0 to count using SMCLK
+    Timer0.clockSourceDivider = TIMER_A_CLOCKSOURCE_DIVIDER_1; //config timerA1 with a divider of 1
+    Timer0.timerPeriod = 800; //set period to PWM frequency of 30kHz
+    Timer_A_configureUpMode(TIMER_A0_BASE, &Timer0); //set timer to upMode
+
+    TimerC3.compareRegister = TIMER_A_CAPTURECOMPARE_REGISTER_3;
+    TimerC3.compareOutputMode = TIMER_A_OUTPUTMODE_RESET_SET;
+    //TimerC3.compareInterruptEnable = TIMER_A_CAPTURECOMPARE_INTERRUPT_DISABLE;
+    TimerC3.compareValue = cvalue3; //set to 0% duty cycle PWM
+    Timer_A_initCompare( TIMER_A0_BASE, &TimerC3);
+
+    TimerC4.compareRegister = TIMER_A_CAPTURECOMPARE_REGISTER_4;
+    TimerC4.compareOutputMode = TIMER_A_OUTPUTMODE_RESET_SET;
+    //TimerC4.compareInterruptEnable = TIMER_A_CAPTURECOMPARE_INTERRUPT_DISABLE;
+    TimerC4.compareValue = cvalue4; //set to 0% duty cycle PWM
+    Timer_A_initCompare( TIMER_A0_BASE, &TimerC4);
+    Timer_A_startCounter(TIMER_A0_BASE, TIMER_A_UP_MODE); //start timer
+
+    //timer_A3_base
+    Timer3.clockSource = TIMER_A_CLOCKSOURCE_SMCLK; //config timerA3 to count using SMCLK
+    Timer3.clockSourceDivider = TIMER_A_CLOCKSOURCE_DIVIDER_1; //config timerA1 with a divider of 1
+    Timer3.timerInterruptEnable_TAIE = TIMER_A_TAIE_INTERRUPT_ENABLE; //enable interrupt
+    Timer3.timerClear = TIMER_A_DO_CLEAR;
+    Timer_A_configureContinuousMode(TIMER_A3_BASE, &Timer3); //set timer to upMode
+
+    Timer_A_registerInterrupt( TIMER_A3_BASE,
+    TIMER_A_CCRX_AND_OVERFLOW_INTERRUPT,  Encoder_ISR);
+    Timer_A_registerInterrupt( TIMER_A3_BASE, TIMER_A_CCR0_INTERRUPT, Encoder_ISR);
+
+    CCR3.captureRegister = TIMER_A_CAPTURECOMPARE_REGISTER_0;
+    CCR3.captureInputSelect = TIMER_A_CAPTURE_INPUTSELECT_CCIxA;
+    CCR3.captureInterruptEnable = TIMER_A_CAPTURECOMPARE_INTERRUPT_ENABLE;
+    CCR3.captureMode = TIMER_A_CAPTUREMODE_RISING_EDGE;
+    Timer_A_initCapture(TIMER_A3_BASE, &CCR3);
+    Timer_A_startCounter(TIMER_A3_BASE, TIMER_A_CONTINUOUS_MODE);
+
+    CCR4.captureRegister = TIMER_A_CAPTURECOMPARE_REGISTER_1;
+    CCR4.captureInputSelect = TIMER_A_CAPTURE_INPUTSELECT_CCIxA;
+    CCR4.captureInterruptEnable = TIMER_A_CAPTURECOMPARE_INTERRUPT_ENABLE;
+    CCR4.captureMode = TIMER_A_CAPTUREMODE_RISING_EDGE;
+    Timer_A_initCapture(TIMER_A3_BASE, &CCR4);
+    Timer_A_startCounter(TIMER_A3_BASE, TIMER_A_CONTINUOUS_MODE);
+
+}
+
+// Add interrupt functions last so they are easy to find
+
+void Encoder_ISR()
+{
+    //printf("left is %u\n", cvalue4);
+    //printf("right is %u\n", cvalue3);
+    if (Timer_A_getEnabledInterruptStatus(
+    TIMER_A3_BASE) == TIMER_A_INTERRUPT_PENDING) //check if timer reset interrupt occurred
+    {
+        Timer_A_clearInterruptFlag(TIMER_A3_BASE); //clear flag
+        enc_counts_track_l += 65536; //add 65536 to enc_counts_track
+        enc_counts_track_r += 65536; //add 65536 to enc_counts_track
+        global_delay++;
+
+    }
+//left wheel
+    if (Timer_A_getCaptureCompareEnabledInterruptStatus(TIMER_A3_BASE,TIMER_A_CAPTURECOMPARE_REGISTER_1))//check if capture event occurred
+    {
+        enc_flag_l = 1;
+        //clear capture event interrupt flag
+        Timer_A_clearCaptureCompareInterrupt(TIMER_A3_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_1);
+        int32_t flag_l = Timer_A_getCaptureCompareCount(TIMER_A3_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_1);
+        enc_total_l++; //increment end_total
+        enc_counts_l = enc_counts_track_l + flag_l;        //time between edges
+        enc_counts_track_l = -1 * flag_l;        //capture value
+        speed_l += enc_counts_l; //sum results with previous results
+        meas_total_l += 1; // add 1 to variable tracking number of results in sum
+        if (meas_total_l == 6)
+        { // if sum tracking variable == 6
+            if (speed_l / 6 > 65000)
+            { //if sum variable /6 > setpoint
+                cvalue4 += 1; //add 1 to PWM value
+                Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_4, cvalue4); //apply PWM value
+            }
+            if (speed_l / 6 < 65000)
+            { //if sum variable /6 < setpoint
+                cvalue4 -= 1; //subtract 1 from PWM value
+                Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_4, cvalue4); //apply PWM value
+            }
+            //printf("speed_l is %u\n", speed_l);
+            speed_l = 0; //reset sum variable
+            meas_total_l = 0; //reset sum tracking variable
+        }
+
+    }
+    //right wheel
+    if (Timer_A_getCaptureCompareEnabledInterruptStatus( TIMER_A3_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_0))//check if capture event occurred
+    {
+        enc_flag_l = 1;
+        //clear capture event interrupt flag
+        Timer_A_clearCaptureCompareInterrupt(TIMER_A3_BASE,TIMER_A_CAPTURECOMPARE_REGISTER_0);
+        int32_t flag_r = Timer_A_getCaptureCompareCount(TIMER_A3_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_0);
+        enc_total_r++; //increment end_total
+        enc_counts_r = enc_counts_track_r + flag_r;            //capture value
+        enc_counts_track_r = -1 * flag_r;            //capture value
+        speed_r += enc_counts_r; //sum results with previous results
+        meas_total_r += 1; // add 1 to variable tracking number of results in sum
+        if (meas_total_r == 6)
+        { // if sum tracking variable == 6
+            if (speed_r / 6 > 65000)
+            { //if sum variable /6 > setpoint (setpoint of 65000 25% duty cycle)
+
+                cvalue3 += 1; //subtract 1 to PWM value
+                Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_3, cvalue3); //apply PWM value
+            }
+            if (speed_r / 6 < 65000)
+            { //if sum variable /6 < setpoint
+                cvalue3 -= 1; //add 1 to PWM value
+                Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_3, cvalue3); //apply PWM value
+            }
+            //printf("speed_r is %u\n", speed_r);
+            speed_r = 0; //reset sum variable
+            meas_total_r = 0; //reset sum tracking variable
+        }
+
+    }
+}
+
+void Straight(uint32_t dist){ //takes in distance to travel as input
+    //set pwm to 200
+    //drive distance
+    //set pwm to 0 for both wheels
+    GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN4 | GPIO_PIN5); //set Dir to forwards for LM and RM
+    cvalue3 = 200; //assign rm pwm to 200
+    cvalue4 = 200; //assign lm pwm to 200
+    Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_4 , cvalue4 ); //set pwm to 200
+    Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_3 , cvalue3 ); //set pwm to 200
+    //uint16_t distance = enc_total / 360.0 * 2.0 * radius * 22.0 / 7.0; // Calculate distance travelled in mm --> solved for enc_total to get timing?s
+
+    while(enc_total_l < (dist * 360.0) / (2 * radius * 22.0 / 7.0)) {
+        //printf("enc_total_l: %u", enc_total_l);
+        //uint32_t p = (dist * 360.0) / (2 * radius * 22.0 / 7.0);
+        //printf("comparevalue: %u",p);
+    } //keep wheels driving until final distance is reached
+    turn_off();
+}
+void Turn(int32_t turn, double coeff)
+{ //takes in tdegree to turn
+    //set speeds equal and oppposite
+    //s = theta * r
+    //run distance certain amount of time for each turn degree
+    turn_off(); //turn motors off
+
+    if (turn > 0)
+    {
+        //turn left
+
+        int32_t arclength = 1.0 * (turn / 360) * (149 * 22.0 / 7.0);
+
+        GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN5); //set Dir to forwards for RM
+        GPIO_setOutputHighOnPin(GPIO_PORT_P5, GPIO_PIN4); //set Dir to forwards for LM
+        cvalue3 = 100; //assign rm pwm to 200
+        cvalue4 = 100; //assign lm pwm to 200
+        Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_4, cvalue4); //set pwm to 200
+        Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_3, cvalue3); //set pwm to 200
+        global_delay = 0;
+        while (enc_total_r < turn * coeff){}
+    }
+    turn_off(); //turn the motor off
+}
+
+void turn_off(){
+    cvalue3 = 0; //assign rm pwm to 0
+    cvalue4 = 0; //assign lm pwm to 0
+    Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_4 , cvalue4 ); //set pwm to 0
+    Timer_A_setCompareValue( TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_3 , cvalue3 );
+    enc_total_l = 0; //reset counts
+    enc_total_r = 0;
+
+}
+
+void Drive(uint32_t * distances, int32_t * turns, double * coeff){ //takes in distances and turns array as the input
+    uint16_t i = 0;
+    for(i = 0; i < 5; i+=1 ){
+        uint32_t dist = distances[i]; //collect distance
+        printf("drive stretch %u: \n", distances[i]);
+        Straight(dist); //drive the certain distance
+
+        int32_t turn = turns[i]; //collect turn number
+        printf("turn number %u: \n", turns[i]);
+
+        Turn(turn, coeff[i]); //turn the certain amount
+        //turn_off();
+    }
+}
